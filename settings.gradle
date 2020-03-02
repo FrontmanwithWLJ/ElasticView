@@ -1,0 +1,3 @@
+rootProject.name='ElasticView'
+include ':app'
+include ':elasticviewlibrary'
