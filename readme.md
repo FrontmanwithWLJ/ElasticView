@@ -1,4 +1,6 @@
-**Function**
+**Function：**
+***
+
 	orientation参数的设置决定当前布局滑动为纵向滑动还是横向滑动
 	setHeaderAdapter()
 	setFooterAdapter()//如果没有设置这两个adapter就只是一个弹性滑动的layout
@@ -8,7 +10,8 @@
 	* @param progress 值位于\[0,offset\],其中offset是adapter设置的开始刷新或者加载的距离
 	*/
 	scrollProgress(progress: Int)
-**Usage**
+
+**Usage：**
 
 [![](https://jitpack.io/v/FrontmanwithWLJ/ElasticView.svg)](https://jitpack.io/#FrontmanwithWLJ/ElasticView)
 
@@ -29,6 +32,7 @@ Step 2. Add the dependency
 
 
 ***
+
 **Version:1.0.0**
 通过ElasticView嵌套View，达到列表弹性滑动，拖动。ElasticView是通过拦截所有触摸事件，分析是否需要向子View发送触摸事件，未支持fling
 **Version:1.1.0**
