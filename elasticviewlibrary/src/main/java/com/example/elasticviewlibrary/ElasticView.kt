@@ -1,20 +1,31 @@
 package com.example.elasticviewlibrary
 
 /**
- * PullView 布局内仅有一个View。headerView和footerView用户设置适配器
+ * ElasticView 布局内仅有一个View。
+ * headerView和footerView用户设置适配器时添加
+ * 拦截所有触摸事件不靠谱，太多不确定因素
+ * 还是用NestedScrollParent
+ * 设置orientation以确定布局纵横滑动
  */
+import android.animation.Animator
 import android.animation.ValueAnimator
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Looper
 import android.util.AttributeSet
 import android.util.Log
 import android.view.MotionEvent
 import android.view.View
+import android.view.ViewConfiguration
 import android.view.ViewGroup
 import android.widget.LinearLayout
+import android.widget.OverScroller
+import android.widget.Scroller
+import androidx.core.animation.addListener
 import androidx.core.view.NestedScrollingParent2
 import androidx.core.view.ViewCompat
 import androidx.core.view.get
+import java.util.concurrent.locks.ReentrantLock
 import kotlin.math.abs
 
 class ElasticView @JvmOverloads constructor(
@@ -22,54 +33,44 @@ class ElasticView @JvmOverloads constructor(
     attrs: AttributeSet? = null,
     defStyleAttr: Int = 0
 ) :
-    LinearLayout(context, attrs, defStyleAttr) {
-    private val TAG = "PullView"
-    //down事件的记录
-    private var oldY = 0f
-    //目标子view
-    private val middleView: View by lazy {
-        if (childCount >= 2)
-            getChildAt(1)
-        else
-            getChildAt(0)
-    }
+    LinearLayout(context, attrs, defStyleAttr), NestedScrollingParent2 {
+    private val TAG = "ElasticView"
     //header
-    private var headerView: View? = null
     private var headerAdapter: HeaderAdapter? = null
     //footer
-    private var footerView: View? = null
     private var footerAdapter: FooterAdapter? = null
-    //是否需要拦截
-    private var isNeedToIntercept = false
     //弹回的动画时间
     private var animTimeLong = 300L
-    private var animTimeShort = animTimeLong / 3
+    private var animTimeShort = animTimeLong / 2
     //阻尼系数
     private var damping = 0.5f
     private var dampingTemp = 0.5f
     //阻尼系数是否需要逐减
     private var isDecrement = true
-    //第一根手指
-    private var firstFingerId = -1
-    //当前活跃的触控点
-    private var currentActionFingerId = -1
-    //是否切换了手指
-    private var isCheckFinger = false
-    //fling是否停止
-    private var stopFling = false
+    //标记布局是否移动
+    private var isMove = false
+    //标记是否出fling状态
+    private var isFling = false
+    //当前是否允许fling
+    private var allowFling = true
+    //弹回动画锁
+    private val lock = ReentrantLock()
 
+    //加载完成的回调
     private val refreshCallBack = object : PullCallBack {
         override fun over() {
+            headerAdapter!!.isRefreshing = false
             postDelayed({
-                springBack(-headerAdapter!!.offset,300)
-            },300)
+                springBack(getScrollXY(), 300)
+            }, 300)
         }
     }
     private val loadCallBack = object : PullCallBack {
         override fun over() {
+            footerAdapter!!.isLoading = false
             postDelayed({
-                springBack(footerAdapter!!.offset,300)
-            },300)
+                springBack(getScrollXY(), 300)
+            }, 300)
         }
     }
 
@@ -79,118 +80,146 @@ class ElasticView @JvmOverloads constructor(
         this.clipToPadding = false
     }
 
-    //拦截所有消息
-    override fun onInterceptTouchEvent(ev: MotionEvent?): Boolean {
-        return true
+
+    //处理嵌套滑动
+    override fun onNestedScrollAccepted(child: View, target: View, axes: Int, type: Int) {}
+
+    //此处无须判断child类型
+    override fun onStartNestedScroll(child: View, target: View, axes: Int, type: Int): Boolean {
+        return (axes and when (orientation) {
+            HORIZONTAL -> ViewCompat.SCROLL_AXIS_HORIZONTAL
+            else -> ViewCompat.SCROLL_AXIS_VERTICAL
+        }) != 0
     }
 
-    @SuppressLint("ClickableViewAccessibility")
-    override fun onTouchEvent(event: MotionEvent?): Boolean {
-        //Log.e(TAG,"get message")
-        if ((headerAdapter != null && headerAdapter!!.isRefreshing) || (footerAdapter != null && footerAdapter!!.isLoading)) {
-            //正在刷新中，拦截所有事件
-            return true
+    /**
+     * @param consumed 记录parent消耗的距离，consumed[0]-->X  [1]-->y
+     */
+    override fun onNestedPreScroll(target: View, dx: Int, dy: Int, consumed: IntArray, type: Int) {
+        if (!shouldScroll()) {//处于加载状态不允许child滑动
+            consumed[0] = dx
+            consumed[1] = dy
+            return
         }
-        if (event == null)
-            return true
-        if (firstFingerId == -1 && (event.action and event.actionMasked) != MotionEvent.ACTION_DOWN)
-            return true
+        //判断是否滑动到边界,滑动到边界的情况交给parent处理
+        if (canScroll(target, dx = dx, dy = dy)) {
+            if (type == ViewCompat.TYPE_TOUCH) {
+                if (!isMove)
+                    isMove = true
+            } else if (type == ViewCompat.TYPE_NON_TOUCH) {
+                if (!allowFling) return//禁止fling
+                isFling = true
+                if (abs(getScrollXY()) >= 100 && isFling) {
+                    allowFling = false//禁止fling
+                    springBack(getScrollXY(), animTimeLong)
+                    return
+                }
+            }
+            //吃掉所有位移
+            consumed[0] = dx
+            consumed[1] = dy
+            scrollBy((dx * dampingTemp).toInt(), (dy * dampingTemp).toInt())
+            calcDamping()
+        } else {//此处有两种情况 一是未到边界的滑动，二是已经移动过布局，但是现在开始反向滑动了
+            if (isMove) {
+                val temp = if (orientation == VERTICAL) dy * damping else dx * damping
+                val scrollOffset = getScrollXY()
+                //防止越界，如果数据越界就设为边界值
+                val offset =
+                    if (scrollOffset <= 0 && temp > -scrollOffset) -scrollOffset
+                    else if (scrollOffset >= 0 && temp < -scrollOffset) -scrollOffset
+                    else temp.toInt()
 
-        when (event.action and event.actionMasked) {
-            MotionEvent.ACTION_DOWN -> {
-                currentActionFingerId = event.getPointerId(event.actionIndex)
-                firstFingerId = currentActionFingerId
-                oldY = getOldXY(event, event.actionIndex)
-            }
-            MotionEvent.ACTION_POINTER_DOWN -> {
-                currentActionFingerId = event.getPointerId(event.actionIndex)
-                isCheckFinger = true
-                return true
-            }
-            MotionEvent.ACTION_POINTER_UP -> {
-                if (firstFingerId == event.getPointerId(event.actionIndex)) {
-                    firstFingerId = currentActionFingerId
-                    return true
-                }
-                currentActionFingerId = firstFingerId
-                oldY = event.getY(event.findPointerIndex(currentActionFingerId))
-                return true
-            }
-            MotionEvent.ACTION_MOVE -> {
-                //如果满足滑动条件则不共享move事件
-                var index = event.findPointerIndex(currentActionFingerId)
-                while (index == -1) {
-                    //没能获取到信息
-                    currentActionFingerId = event.getPointerId(event.actionIndex)
-                    firstFingerId = currentActionFingerId
-                    index = event.findPointerIndex(currentActionFingerId)
-                }
-                val newXY = getOldXY(event, index)
-                if (isCheckFinger) {
-                    oldY = newXY
-                    isCheckFinger = false
-                    return true
-                }
-                val offset = oldY - newXY
-                oldY = newXY
-                if (isNeedToIntercept) {
-                    onScrolled(offset)
-                    return true
-                    //canScrollVertically(1)滑动到底部返回false，canScrollVertically(-1)滑动到顶部返回false
-                } else if (canScroll(-1) && offset < -2f || canScroll(1) && offset > 2f) {
-                    onScrolled(offset)
-                    isNeedToIntercept = true
-                    return true
-                }
-            }
-            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (isNeedToIntercept) {//需要拦截，不共享
-                    //清空手指记录
-                    firstFingerId = -1
-                    currentActionFingerId = -1
-                    isNeedToIntercept = false
-                    oldY = 0f
-                    if (headerAdapter != null && getScrollXY() <= -headerAdapter!!.offset) {
-                        springBack(getScrollXY() + headerAdapter!!.offset, 300)
-                        headerAdapter!!.onRefresh()
-                        return true
-                    } else if (footerAdapter != null && getScrollXY() >= footerAdapter!!.offset) {
-                        springBack(getScrollXY() - footerAdapter!!.offset, 300)
-                        footerAdapter!!.onLoad()
-                        return true
-                    }
-                    springBack(getScrollXY(), 300)
-                    return true
-                }
+                scrollBy(offset, offset)
+                calcDamping()
+                consumed[0] = dx
+                consumed[1] = dy
             }
         }
-        //最后共享满足条件所有消息
-        middleView.dispatchTouchEvent(event)
-        return true
+    }
+
+    override fun onNestedScroll(
+        target: View,
+        dxConsumed: Int,
+        dyConsumed: Int,
+        dxUnconsumed: Int,
+        dyUnconsumed: Int,
+        type: Int
+    ) {
+    }
+
+    //子view停止移动
+    override fun onStopNestedScroll(target: View, type: Int) {
+        if (!shouldScroll()) return
+        //Log.e(TAG,"first move =$isMove fling =$isFling type=$type")
+        if (!isMove && isFling) {
+            allowFling = true
+            isFling = false
+            return
+        }
+        if (!isMove) return
+        val scrollOffset = getScrollXY()
+        isMove = false
+        if (headerAdapter != null && scrollOffset < 0 && scrollOffset < -headerAdapter!!.offset) {
+            springBack(headerAdapter!!.offset + scrollOffset, animTimeShort)
+            headerAdapter!!.isRefreshing = true
+            headerAdapter!!.onRefresh()
+            return
+        }
+        if (footerAdapter != null && scrollOffset > 0 && scrollOffset < footerAdapter!!.offset) {
+            springBack(scrollOffset - footerAdapter!!.offset, animTimeShort)
+            footerAdapter!!.isLoading = true
+            footerAdapter!!.onLoad()
+            return
+        }
+        springBack(scrollOffset, animTimeLong)
+
+    }
+
+    override fun scrollBy(x: Int, y: Int) {
+        //根据布局选择移动水平垂直
+        if (orientation == VERTICAL) {
+            super.scrollBy(0, y)
+        } else {
+            super.scrollBy(x, 0)
+        }
+        val scrollOffset = getScrollXY()
+        //更新控件header，footer状态
+        if (scrollOffset < 0) {
+            if (headerAdapter == null) return
+            if (-scrollOffset <= headerAdapter!!.offset) {
+                headerAdapter!!.scrollProgress(-scrollOffset)
+                headerAdapter!!.pullToRefresh()
+            } else {
+                headerAdapter!!.releaseToRefresh()
+            }
+        } else {
+            if (footerAdapter == null) return
+            if (scrollOffset <= footerAdapter!!.offset) {
+                footerAdapter!!.scrollProgress(-scrollOffset)
+                footerAdapter!!.pullToLoad()
+            } else {
+                footerAdapter!!.releaseToLoad()
+            }
+        }
     }
 
     /**
      * 根据布局orientation属性判断横向纵向滑动是否触及边缘
      */
-    private fun canScroll(direction: Int): Boolean {
+    private fun canScroll(child: View, direction: Int = 0, dx: Int = 0, dy: Int = 0): Boolean {
         //canScrollVertically(1)滑动到底部返回false，canScrollVertically(-1)滑动到顶部返回false
         //canScrollHorizontally(1)滑动到右侧底部返回false，canScrollHorizontally(-1)滑动到左侧顶部返回false
         return if (orientation == VERTICAL) {
-            !middleView.canScrollVertically(direction)
+            if (dy == 0)
+                !child.canScrollVertically(direction)
+            else
+                !child.canScrollVertically(dy)
         } else {
-            !middleView.canScrollHorizontally(direction)
-        }
-    }
-
-    /**
-     * @param index 当前活跃的手指
-     * 获取event的X值或者Y值
-     */
-    private fun getOldXY(event: MotionEvent, index: Int): Float {
-        return if (orientation == VERTICAL) {
-            event.getY(index)
-        } else {
-            event.getX(index)
+            if (dx == 0)
+                !child.canScrollHorizontally(direction)
+            else
+                !child.canScrollHorizontally(dx)
         }
     }
 
@@ -198,61 +227,16 @@ class ElasticView @JvmOverloads constructor(
      * 获取X或者Y的滚动值
      */
     private fun getScrollXY(): Int {
-        return if (orientation == VERTICAL) {
+        return if (orientation == VERTICAL)
             scrollY
-        } else {
+        else
             scrollX
-        }
     }
 
-    //对滚动消息初步处理，调整滚动值，更新状态
-    private fun onScrolled(deltaY: Float) {
-        if (!isNeedToIntercept)
-            isNeedToIntercept = true
-        if ((getScrollXY() < 0 && deltaY > 2) || (getScrollXY() > 0 && deltaY < -2)) {
-            var offset = deltaY * damping
-            if (offset < 0 && (-offset > getScrollXY())
-                || offset > 0 && -offset < getScrollXY()
-            ) {
-                offset = (-getScrollXY()).toFloat()
-            }
-            scroll(offset.toInt())
-        } else if (canScroll(-1) && deltaY < -2f || canScroll(1) && deltaY > 2f) {//下拉和上滑
-            val offset = deltaY * dampingTemp
-            scroll(offset.toInt())
-            if (isDecrement) {
-                calcDamping()
-            }
-        }
-        if (getScrollXY() < 0) {
-            if (headerAdapter == null)
-                return
-            if (getScrollXY() < -headerAdapter!!.offset) {
-                headerAdapter!!.releaseToRefresh()
-            } else {
-                headerAdapter!!.scrollProgress(abs(getScrollXY()))
-                headerAdapter!!.pullToRefresh()
-            }
-        } else {
-            if (footerAdapter == null)
-                return
-            if (getScrollXY() > footerAdapter!!.offset) {
-                footerAdapter!!.releaseToLoad()
-            } else {
-                footerAdapter!!.scrollProgress(abs(getScrollXY()))
-                footerAdapter!!.pullToLoad()
-            }
-        }
-    }
-
-    //滚动视图
-    private fun scroll(delta: Int) {
-        if (delta == 0) return
-        if (orientation == VERTICAL) {
-            scrollBy(0, delta)
-        } else {
-            scrollBy(delta, 0)
-        }
+    //判断当前是否处于刷新加载状态
+    private fun shouldScroll(): Boolean {
+        return !((headerAdapter != null && headerAdapter!!.isRefreshing)
+                || (footerAdapter != null && footerAdapter!!.isLoading))
     }
 
     /**
@@ -286,7 +270,8 @@ class ElasticView @JvmOverloads constructor(
 
     //弹回动画
     private fun springBack(offset: Int, animTime: Long) {
-//        Log.e(TAG,"springBack=$offset currentXY =${getScrollXY()}")
+        if (lock.isLocked || !shouldScroll()) return
+        lock.lock()
         val animator = ValueAnimator.ofInt(0, -offset)
         animator.duration = animTime
         val oy = getScrollXY()    //当前getScrollXY()
@@ -296,6 +281,17 @@ class ElasticView @JvmOverloads constructor(
             else
                 scrollTo(oy + animation.animatedValue as Int, scrollY)
         }
+        animator.addListener(object : Animator.AnimatorListener {
+            override fun onAnimationRepeat(animation: Animator?) {}
+
+            override fun onAnimationEnd(animation: Animator?) {
+                lock.unlock()
+            }
+
+            override fun onAnimationCancel(animation: Animator?) {}
+
+            override fun onAnimationStart(animation: Animator?) {}
+        })
         post { animator.start() }
     }
 
@@ -310,12 +306,11 @@ class ElasticView @JvmOverloads constructor(
             Log.e(TAG, "only support three views")
             return
         }
-        headerView = view
-        addView(headerView, 0)//最底层
-        headerView!!.post {
-            val height = headerView!!.measuredHeight
-            val width = headerView!!.measuredWidth
-            var layoutParams: LayoutParams?
+        addView(view, 0)//最底层
+        view.post {
+            val height = view.measuredHeight
+            val width = view.measuredWidth
+            val layoutParams: LayoutParams?
             //使其位于布局范围之外
             if (orientation == VERTICAL) {
                 layoutParams = LayoutParams(LayoutParams.MATCH_PARENT, height)
@@ -324,7 +319,7 @@ class ElasticView @JvmOverloads constructor(
                 layoutParams = LayoutParams(width, LayoutParams.MATCH_PARENT)
                 layoutParams.leftMargin = -width
             }
-            headerView!!.layoutParams = layoutParams
+            view.layoutParams = layoutParams
         }
     }
 
@@ -340,23 +335,10 @@ class ElasticView @JvmOverloads constructor(
             Log.e(TAG, "only support three views")
             return
         }
-        footerView = view
-        addView(footerView, 2)
+        addView(view, 2)
 
     }
 
-    /**
-     * 将自身置于底层,仅适用于相对布局、帧布局 RelativeLayout，FrameLayout
-     */
-    fun sendToBack() {
-        val group = parent as ViewGroup
-        val count = group.childCount
-        for (i in 0 until count) {
-            if (group[i] != this) {
-                group[i].bringToFront()//置顶除自身外的所有view
-            }
-        }
-    }
 
     abstract class HeaderAdapter(var offset: Int) {
         var isRefreshing = false
@@ -399,4 +381,5 @@ class ElasticView @JvmOverloads constructor(
     interface PullCallBack {
         fun over()
     }
+
 }
